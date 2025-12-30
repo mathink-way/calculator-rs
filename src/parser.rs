@@ -181,17 +181,16 @@ impl<'a> Parser<'a> {
         if let Some((op, _)) = self.match_symbol(&['+', '-']) {
             // Специальная обработка: унарный минус перед числом
             // Это нужно для поддержки i64::MIN (-9223372036854775808)
-            if op == '-' {
-                if let Some(Ok(SpannedToken {
+            if op == '-'
+                && let Some(Ok(SpannedToken {
                     token: Token::Number(n),
                     pos,
                 })) = self.peek()
-                {
-                    let n = *n;
-                    let pos = *pos;
-                    self.advance();
-                    return Self::make_negative_literal(n, pos);
-                }
+            {
+                let n = *n;
+                let pos = *pos;
+                self.advance();
+                return Self::make_negative_literal(n, pos);
             }
 
             let child = self.unary()?;
@@ -396,7 +395,7 @@ mod tests {
         if let ParseError::UnexpectedToken { pos, .. } = err {
             assert_eq!(pos, 4);
         } else {
-            panic!("expected UnexpectedToken, got {:?}", err);
+            panic!("expected UnexpectedToken, got {err:?}");
         }
     }
 
