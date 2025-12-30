@@ -1,3 +1,4 @@
+pub mod expression;
 pub mod token;
 
 pub fn run() {
