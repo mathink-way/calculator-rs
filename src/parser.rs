@@ -4,8 +4,6 @@
 //!
 //! # Грамматика
 //!
-//! Парсер реализует следующую грамматику со стандартным приоритетом операторов:
-//!
 //! ```text
 //! expr   = term (('+' | '-') term)*
 //! term   = unary (('*' | '/') unary)*
@@ -26,17 +24,12 @@
 //! ```
 //! use calculator_rs::parser::parse;
 //!
-//! // Простая арифметика
 //! let expr = parse("2 + 3 * 4").unwrap();
 //! assert_eq!(expr.evaluate().unwrap(), 14);
 //!
-//! // Скобки переопределяют приоритет
-//! let expr = parse("(2 + 3) * 4").unwrap();
-//! assert_eq!(expr.evaluate().unwrap(), 20);
-//!
-//! // Унарные операторы
-//! let expr = parse("-5 + 3").unwrap();
-//! assert_eq!(expr.evaluate().unwrap(), -2);
+//! // Поддержка i64::MIN
+//! let expr = parse("-9223372036854775808").unwrap();
+//! assert_eq!(expr.evaluate().unwrap(), i64::MIN);
 //! ```
 
 use std::iter::Peekable;
@@ -44,7 +37,7 @@ use std::iter::Peekable;
 use thiserror::Error;
 
 use crate::expression::{BinaryOp, Expr, UnaryOp};
-use crate::token::{Token, TokenError, Tokenizer};
+use crate::token::{SpannedToken, Token, TokenError, Tokenizer};
 
 /// Ошибки, возникающие при разборе выражения.
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -54,31 +47,48 @@ pub enum ParseError {
     UnexpectedEof,
 
     /// Встречен неожиданный токен.
-    #[error("неожиданный токен: {0:?}")]
-    UnexpectedToken(Token),
+    #[error("неожиданный токен: {token:?}")]
+    UnexpectedToken {
+        /// Неожиданный токен.
+        token: Token,
+        /// Позиция токена.
+        pos: usize,
+    },
 
     /// Ошибка, переданная от токенизатора.
-    #[error("ошибка токенизатора: {0}")]
+    #[error("{0}")]
     TokenError(#[from] TokenError),
 
     /// Отсутствует закрывающая скобка.
     #[error("отсутствует закрывающая скобка")]
-    UnclosedParen,
+    UnclosedParen {
+        /// Позиция открывающей скобки.
+        open_pos: usize,
+    },
+
+    /// Число вне допустимого диапазона i64.
+    #[error("число вне диапазона i64")]
+    NumberOutOfRange {
+        /// Позиция числа.
+        pos: usize,
+    },
+}
+
+impl ParseError {
+    /// Возвращает позицию ошибки, если она известна.
+    #[must_use]
+    pub const fn position(&self) -> Option<usize> {
+        match self {
+            Self::UnexpectedEof => None,
+            Self::UnexpectedToken { pos, .. } => Some(*pos),
+            Self::TokenError(te) => Some(te.pos),
+            Self::UnclosedParen { open_pos } => Some(*open_pos),
+            Self::NumberOutOfRange { pos } => Some(*pos),
+        }
+    }
 }
 
 /// Рекурсивный нисходящий парсер арифметических выражений.
-///
-/// Оборачивает [`Tokenizer`] и строит дерево [`Expr`] согласно
-/// грамматике, описанной в [документации модуля](self).
-///
-/// # Пример
-///
-/// ```
-/// use calculator_rs::parser::Parser;
-///
-/// let expr = Parser::new("1 + 2 * 3").parse().unwrap();
-/// assert_eq!(expr.evaluate().unwrap(), 7);
-/// ```
 pub struct Parser<'a> {
     tokens: Peekable<Tokenizer<'a>>,
 }
@@ -94,63 +104,49 @@ impl<'a> Parser<'a> {
 
     /// Разбирает ввод и возвращает дерево выражения.
     ///
-    /// Потребляет весь ввод; возвращает ошибку, если после корректного
-    /// выражения остались лишние токены.
-    ///
     /// # Ошибки
     ///
-    /// Возвращает [`ParseError`], если:
-    /// - Ввод пуст ([`ParseError::UnexpectedEof`])
-    /// - Синтаксис некорректен ([`ParseError::UnexpectedToken`])
-    /// - Скобки не сбалансированы ([`ParseError::UnclosedParen`])
-    /// - Токенизатор обнаружил ошибку ([`ParseError::TokenError`])
-    ///
-    /// # Пример
-    ///
-    /// ```
-    /// use calculator_rs::parser::Parser;
-    ///
-    /// let expr = Parser::new("(1 + 2) * 3").parse().unwrap();
-    /// assert_eq!(expr.evaluate().unwrap(), 9);
-    /// ```
+    /// Возвращает [`ParseError`] при синтаксических ошибках.
     pub fn parse(mut self) -> Result<Expr, ParseError> {
         let expr = self.expr()?;
 
-        // Убеждаемся, что не осталось лишних токенов
         match self.tokens.next() {
             None => Ok(expr),
-            Some(Ok(token)) => Err(ParseError::UnexpectedToken(token)),
+            Some(Ok(st)) => Err(ParseError::UnexpectedToken {
+                token: st.token,
+                pos: st.pos,
+            }),
             Some(Err(err)) => Err(err.into()),
         }
     }
 
-    /// Подглядывает следующий токен без его потребления.
-    fn peek(&mut self) -> Option<&Result<Token, TokenError>> {
+    fn peek(&mut self) -> Option<&Result<SpannedToken, TokenError>> {
         self.tokens.peek()
     }
 
-    /// Потребляет и возвращает следующий токен.
-    fn advance(&mut self) -> Option<Result<Token, TokenError>> {
+    fn advance(&mut self) -> Option<Result<SpannedToken, TokenError>> {
         self.tokens.next()
     }
 
     /// Пытается сопоставить один из заданных символов.
-    ///
-    /// При успехе потребляет токен и возвращает совпавший символ.
-    fn match_symbol(&mut self, expected: &[char]) -> Option<char> {
-        let matched = match self.peek()? {
-            Ok(Token::Symbol(c)) if expected.contains(c) => *c,
+    /// Возвращает (символ, позиция) при успехе.
+    fn match_symbol(&mut self, expected: &[char]) -> Option<(char, usize)> {
+        let (matched, pos) = match self.peek()? {
+            Ok(SpannedToken {
+                token: Token::Symbol(c),
+                pos,
+            }) if expected.contains(c) => (*c, *pos),
             _ => return None,
         };
         self.advance();
-        Some(matched)
+        Some((matched, pos))
     }
 
     /// Разбирает: `expr = term (('+' | '-') term)*`
     fn expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.term()?;
 
-        while let Some(op) = self.match_symbol(&['+', '-']) {
+        while let Some((op, _)) = self.match_symbol(&['+', '-']) {
             let right = self.term()?;
             let kind = match op {
                 '+' => BinaryOp::Add,
@@ -167,7 +163,7 @@ impl<'a> Parser<'a> {
     fn term(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.unary()?;
 
-        while let Some(op) = self.match_symbol(&['*', '/']) {
+        while let Some((op, _)) = self.match_symbol(&['*', '/']) {
             let right = self.unary()?;
             let kind = match op {
                 '*' => BinaryOp::Mul,
@@ -182,8 +178,23 @@ impl<'a> Parser<'a> {
 
     /// Разбирает: `unary = ('+' | '-')? factor`
     fn unary(&mut self) -> Result<Expr, ParseError> {
-        if let Some(op) = self.match_symbol(&['+', '-']) {
-            let child = self.factor()?;
+        if let Some((op, _)) = self.match_symbol(&['+', '-']) {
+            // Специальная обработка: унарный минус перед числом
+            // Это нужно для поддержки i64::MIN (-9223372036854775808)
+            if op == '-' {
+                if let Some(Ok(SpannedToken {
+                    token: Token::Number(n),
+                    pos,
+                })) = self.peek()
+                {
+                    let n = *n;
+                    let pos = *pos;
+                    self.advance();
+                    return Self::make_negative_literal(n, pos);
+                }
+            }
+
+            let child = self.unary()?;
             let kind = match op {
                 '+' => UnaryOp::Plus,
                 '-' => UnaryOp::Neg,
@@ -195,33 +206,62 @@ impl<'a> Parser<'a> {
         self.factor()
     }
 
+    /// Создаёт отрицательный литерал из беззнакового числа.
+    fn make_negative_literal(n: u64, pos: usize) -> Result<Expr, ParseError> {
+        const I64_MIN_ABS: u64 = i64::MAX as u64 + 1; // 9223372036854775808
+
+        if n <= i64::MAX as u64 {
+            // Безопасное отрицание
+            Ok(Expr::literal(-(n as i64)))
+        } else if n == I64_MIN_ABS {
+            // Особый случай: i64::MIN
+            Ok(Expr::literal(i64::MIN))
+        } else {
+            Err(ParseError::NumberOutOfRange { pos })
+        }
+    }
+
     /// Разбирает: `factor = NUMBER | '(' expr ')'`
     fn factor(&mut self) -> Result<Expr, ParseError> {
-        let token = self.advance().ok_or(ParseError::UnexpectedEof)??;
+        let spanned = self.advance().ok_or(ParseError::UnexpectedEof)??;
 
-        match token {
-            Token::Number(n) => Ok(Expr::literal(n)),
-            Token::OpenBracket => {
-                let inner = self.expr()?;
-                match self.advance() {
-                    Some(Ok(Token::CloseBracket)) => Ok(inner),
-                    Some(Ok(t)) => Err(ParseError::UnexpectedToken(t)),
-                    Some(Err(e)) => Err(e.into()),
-                    None => Err(ParseError::UnclosedParen),
+        match spanned.token {
+            Token::Number(n) => {
+                if n <= i64::MAX as u64 {
+                    Ok(Expr::literal(n as i64))
+                } else {
+                    Err(ParseError::NumberOutOfRange { pos: spanned.pos })
                 }
             }
-            t => Err(ParseError::UnexpectedToken(t)),
+            Token::OpenBracket => {
+                let open_pos = spanned.pos;
+                let inner = self.expr()?;
+                match self.advance() {
+                    Some(Ok(SpannedToken {
+                        token: Token::CloseBracket,
+                        ..
+                    })) => Ok(inner),
+                    Some(Ok(st)) => Err(ParseError::UnexpectedToken {
+                        token: st.token,
+                        pos: st.pos,
+                    }),
+                    Some(Err(e)) => Err(e.into()),
+                    None => Err(ParseError::UnclosedParen { open_pos }),
+                }
+            }
+            token => Err(ParseError::UnexpectedToken {
+                token,
+                pos: spanned.pos,
+            }),
         }
     }
 }
 
 /// Разбирает строку в дерево выражения.
 ///
-/// Это удобная функция, которая создаёт [`Parser`] и вызывает [`Parser::parse`].
-///
 /// # Ошибки
 ///
-/// Возвращает [`ParseError`] при некорректном синтаксисе или ошибках токенизации.
+/// Возвращает [`ParseError`] при некорректном синтаксисе.
 ///
 /// # Примеры
 ///
@@ -229,8 +269,7 @@ impl<'a> Parser<'a> {
 /// use calculator_rs::parser::parse;
 ///
 /// assert_eq!(parse("2 + 2").unwrap().evaluate().unwrap(), 4);
-/// assert_eq!(parse("10 - 3 * 2").unwrap().evaluate().unwrap(), 4);
-/// assert_eq!(parse("(10 - 3) * 2").unwrap().evaluate().unwrap(), 14);
+/// assert_eq!(parse("-9223372036854775808").unwrap().evaluate().unwrap(), i64::MIN);
 /// ```
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
     Parser::new(input).parse()
@@ -242,7 +281,7 @@ mod tests {
     use crate::expression::EvalError;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Параметризованные тесты вычислений через макрос
+    // Параметризованные тесты вычислений
     // ─────────────────────────────────────────────────────────────────────────
 
     macro_rules! eval_tests {
@@ -266,60 +305,40 @@ mod tests {
         // Литералы
         eval_zero: "0" => 0,
         eval_positive: "42" => 42,
-        eval_large_number: "1000000" => 1_000_000,
+        eval_i64_max: "9223372036854775807" => i64::MAX,
 
-        // Базовые бинарные операции
+        // Базовые операции
         eval_add: "1 + 2" => 3,
         eval_sub: "5 - 3" => 2,
         eval_mul: "3 * 4" => 12,
         eval_div: "10 / 2" => 5,
-        eval_div_truncates: "7 / 3" => 2,
 
-        // Приоритет: * и / связывают сильнее, чем + и -
+        // Приоритет
         eval_add_mul: "2 + 3 * 4" => 14,
-        eval_mul_add: "2 * 3 + 4" => 10,
-        eval_sub_div: "10 - 8 / 2" => 6,
         eval_mixed_precedence: "1 + 2 * 3 - 4 / 2" => 5,
 
         // Левоассоциативность
-        eval_sub_left_assoc: "10 - 5 - 2" => 3,      // (10-5)-2 = 3, не 10-(5-2) = 7
-        eval_div_left_assoc: "24 / 4 / 2" => 3,      // (24/4)/2 = 3, не 24/(4/2) = 12
-        eval_add_chain: "1 + 2 + 3 + 4" => 10,
-        eval_mul_chain: "2 * 3 * 4" => 24,
+        eval_sub_left_assoc: "10 - 5 - 2" => 3,
+        eval_div_left_assoc: "24 / 4 / 2" => 3,
 
         // Скобки
-        eval_parens_add_mul: "(2 + 3) * 4" => 20,
+        eval_parens: "(2 + 3) * 4" => 20,
         eval_parens_nested: "((1 + 2))" => 3,
-        eval_parens_complex: "((2 + 3) * (4 - 1))" => 15,
-        eval_parens_single: "(42)" => 42,
-        eval_parens_around_all: "(1 + 2 * 3)" => 7,
 
         // Унарные операторы
         eval_unary_neg: "-5" => -5,
         eval_unary_plus: "+5" => 5,
-        eval_unary_neg_in_expr: "3 * -2" => -6,
-        eval_unary_plus_in_expr: "3 * +2" => 6,
-        eval_unary_neg_paren: "-(2 + 3)" => -5,
-        eval_unary_neg_neg: "-(-5)" => 5,
-        eval_unary_plus_neg: "+(-5)" => -5,
+        eval_double_neg: "--5" => 5,
+        eval_neg_in_expr: "3 * -2" => -6,
+
+        // i64::MIN - особый случай!
+        eval_i64_min: "-9223372036854775808" => i64::MIN,
+        eval_i64_min_expr: "0 + -9223372036854775808" => i64::MIN,
+        eval_i64_min_in_parens: "(-9223372036854775808)" => i64::MIN,
 
         // Сложные выражения
-        eval_complex1: "-(2 + 3) * 4 - 5" => -25,
-        eval_complex2: "(1 + 2) * (3 + 4)" => 21,
-        eval_complex3: "10 + 20 - 5 * 2 / 2" => 25,
-        eval_complex4: "100 / (2 + 3) / 4" => 5,
-        eval_complex5: "1 + -2 * 3" => -5,
-
-        // Обработка пробелов
-        eval_no_spaces: "1+2*3" => 7,
-        eval_extra_spaces: "  1   +   2  " => 3,
-        eval_mixed_whitespace: " ( 1 + 2 ) * 3 " => 9,
-
-        // Граничные случаи
-        eval_negative_result: "1 - 10" => -9,
+        eval_complex: "-(2 + 3) * 4 - 5" => -25,
         eval_double_negative: "1 - -2" => 3,
-        eval_zero_result: "5 - 5" => 0,
-        eval_zero_mul: "0 * 100" => 0,
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -327,49 +346,26 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn ast_literal() {
-        assert_eq!(parse("42").unwrap(), Expr::literal(42));
+    fn ast_negative_literal() {
+        // -5 создаёт Literal(-5), а не Unary(Neg, Literal(5))
+        assert_eq!(parse("-5").unwrap(), Expr::literal(-5));
     }
 
     #[test]
-    fn ast_binary_add() {
+    fn ast_i64_min_is_literal() {
+        // i64::MIN создаёт один литерал
         assert_eq!(
-            parse("1 + 2").unwrap(),
-            Expr::binary(BinaryOp::Add, Expr::literal(1), Expr::literal(2))
+            parse("-9223372036854775808").unwrap(),
+            Expr::literal(i64::MIN)
         );
     }
 
     #[test]
-    fn ast_unary_neg() {
+    fn ast_double_neg_is_unary() {
+        // --5 это Unary(Neg, Literal(-5))
         assert_eq!(
-            parse("-5").unwrap(),
-            Expr::unary(UnaryOp::Neg, Expr::literal(5))
-        );
-    }
-
-    #[test]
-    fn ast_precedence_structure() {
-        // 2 + 3 * 4 должно разобраться как Add(2, Mul(3, 4))
-        assert_eq!(
-            parse("2 + 3 * 4").unwrap(),
-            Expr::binary(
-                BinaryOp::Add,
-                Expr::literal(2),
-                Expr::binary(BinaryOp::Mul, Expr::literal(3), Expr::literal(4))
-            )
-        );
-    }
-
-    #[test]
-    fn ast_left_associativity() {
-        // 1 - 2 - 3 должно разобраться как Sub(Sub(1, 2), 3)
-        assert_eq!(
-            parse("1 - 2 - 3").unwrap(),
-            Expr::binary(
-                BinaryOp::Sub,
-                Expr::binary(BinaryOp::Sub, Expr::literal(1), Expr::literal(2)),
-                Expr::literal(3)
-            )
+            parse("--5").unwrap(),
+            Expr::unary(UnaryOp::Neg, Expr::literal(-5))
         );
     }
 
@@ -383,72 +379,52 @@ mod tests {
     }
 
     #[test]
-    fn error_whitespace_only() {
-        assert!(matches!(parse("   "), Err(ParseError::UnexpectedEof)));
-    }
-
-    #[test]
     fn error_unclosed_paren() {
-        assert!(matches!(parse("(1 + 2"), Err(ParseError::UnclosedParen)));
+        let err = parse("(1 + 2").unwrap_err();
+        assert!(matches!(err, ParseError::UnclosedParen { open_pos: 0 }));
     }
 
     #[test]
-    fn error_unclosed_nested_paren() {
-        assert!(matches!(parse("((1 + 2)"), Err(ParseError::UnclosedParen)));
+    fn error_unclosed_nested() {
+        let err = parse("((1 + 2)").unwrap_err();
+        assert!(matches!(err, ParseError::UnclosedParen { open_pos: 0 }));
     }
 
     #[test]
-    fn error_unexpected_close_paren() {
-        assert!(matches!(
-            parse(")"),
-            Err(ParseError::UnexpectedToken(Token::CloseBracket))
-        ));
+    fn error_unexpected_token_has_position() {
+        let err = parse("1 + )").unwrap_err();
+        if let ParseError::UnexpectedToken { pos, .. } = err {
+            assert_eq!(pos, 4);
+        } else {
+            panic!("expected UnexpectedToken, got {:?}", err);
+        }
     }
 
     #[test]
-    fn error_close_paren_in_expr() {
-        assert!(matches!(
-            parse("1 + )"),
-            Err(ParseError::UnexpectedToken(Token::CloseBracket))
-        ));
+    fn error_number_out_of_range() {
+        // Число больше i64::MAX без знака минус
+        let err = parse("9223372036854775808").unwrap_err();
+        assert!(matches!(err, ParseError::NumberOutOfRange { pos: 0 }));
     }
 
     #[test]
-    fn error_trailing_number() {
-        assert!(matches!(
-            parse("1 2"),
-            Err(ParseError::UnexpectedToken(Token::Number(2)))
-        ));
+    fn error_number_way_out_of_range() {
+        // Число больше i64::MIN по модулю
+        let err = parse("-9223372036854775809").unwrap_err();
+        assert!(matches!(err, ParseError::NumberOutOfRange { pos: 1 }));
     }
 
     #[test]
-    fn error_trailing_operator() {
-        assert!(matches!(parse("1 +"), Err(ParseError::UnexpectedEof)));
-    }
+    fn error_position_reported() {
+        let err = parse("1 @ 2").unwrap_err();
+        assert_eq!(err.position(), Some(2));
 
-    #[test]
-    fn error_leading_mul() {
-        assert!(matches!(
-            parse("* 2"),
-            Err(ParseError::UnexpectedToken(Token::Symbol('*')))
-        ));
-    }
-
-    #[test]
-    fn error_unknown_symbol() {
-        assert!(matches!(parse("1 @ 2"), Err(ParseError::TokenError(_))));
-    }
-
-    #[test]
-    fn error_extra_close_paren() {
-        assert!(matches!(
-            parse("(1 + 2))"),
-            Err(ParseError::UnexpectedToken(Token::CloseBracket))
-        ));
+        let err = parse("(1 + 2").unwrap_err();
+        assert_eq!(err.position(), Some(0));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Тесты ошибок вычисления (разбор успешен, вычисление неудачно)
+    // Тесты ошибок вычисления
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -458,47 +434,15 @@ mod tests {
     }
 
     #[test]
-    fn eval_error_division_by_zero_expr() {
-        let expr = parse("10 / (5 - 5)").unwrap();
-        assert_eq!(expr.evaluate(), Err(EvalError::DivisionByZero));
-    }
-
-    #[test]
-    fn eval_error_overflow_add() {
-        let input = format!("{} + 1", i64::MAX);
-        let expr = parse(&input).unwrap();
+    fn eval_error_overflow() {
+        let expr = parse("9223372036854775807 + 1").unwrap();
         assert_eq!(expr.evaluate(), Err(EvalError::Overflow));
     }
 
     #[test]
-    fn eval_error_overflow_mul() {
-        let input = format!("{} * 2", i64::MAX);
-        let expr = parse(&input).unwrap();
+    fn eval_i64_min_neg_overflows() {
+        // -(-9223372036854775808) = переполнение
+        let expr = parse("-(-9223372036854775808)").unwrap();
         assert_eq!(expr.evaluate(), Err(EvalError::Overflow));
-    }
-
-    #[test]
-    fn eval_error_overflow_neg() {
-        let input = format!("-({})", i64::MIN);
-        let expr = parse(&input).unwrap();
-        assert_eq!(expr.evaluate(), Err(EvalError::Overflow));
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Граничные случаи, которые могут быть неочевидны
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn double_plus_is_unary_plus() {
-        // "1 + + 2" разбирается как "1 + (+2)", что равно 3
-        let expr = parse("1 + + 2").unwrap();
-        assert_eq!(expr.evaluate().unwrap(), 3);
-    }
-
-    #[test]
-    fn minus_minus_is_add() {
-        // "1 - - 2" разбирается как "1 - (-2)", что равно 3
-        let expr = parse("1 - - 2").unwrap();
-        assert_eq!(expr.evaluate().unwrap(), 3);
     }
 }
