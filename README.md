@@ -1,5 +1,13 @@
 # calculator_rs
 
+[![CI](https://github.com/mathink-way/calculator-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mathink-way/calculator-rs/actions/workflows/ci.yml)
+
+[![Coverage Status](https://coveralls.io/repos/github/mathink-way/calculator-rs/badge.svg?branch=main)](https://coveralls.io/github/mathink-way/calculator-rs?branch=main)
+
+![GitHub top language](https://img.shields.io/github/languages/top/mathink-way/calculator-rs)
+
+![GitHub license](https://img.shields.io/github/license/mathink-way/calculator-rs)
+
 A simple command-line arithmetic calculator written in Rust.
 
 ## Features
